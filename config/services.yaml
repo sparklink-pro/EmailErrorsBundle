@@ -18,3 +18,9 @@ services:
             - "%email_errors.ignored_exception_classes%"
             - "%email_errors.ignored_exception_messages%"
             - "%email_errors.ignored_ip_addresses%"
+            # Optional: enables the "Security" panel (user, roles, session cookie)
+            # in projects using the security component; null otherwise.
+            - "@?security.token_storage"
+            # Throttling of identical errors (option "throttle", in seconds, 0 = off)
+            - "@?cache.app"
+            - "%email_errors.throttle%"
