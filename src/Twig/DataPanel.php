@@ -22,7 +22,11 @@ class DataPanel
         return $this->title ?? "";
     }
 
-    public function getData(): array
+    /**
+     * An array for TYPE_ARRAY panels; a string for TYPE_STRING ones; any decoded JSON value (array or scalar) for
+     * TYPE_JSON ones.
+     */
+    public function getData(): mixed
     {
         return $this->data ?? [];
     }

@@ -67,7 +67,7 @@ final class ExceptionMailerTest extends TestCase
 
         $panels = $this->createMailer()->panels(new Request(), $exception);
 
-        $this->assertNotNull($this->findPanel($panels, 'Probable cause'));
+        $this->assertStringContainsString('not authenticated', $this->findPanel($panels, 'Probable cause')?->getData());
     }
 
     public function testNoProbableCauseWhenAuthenticated(): void
@@ -241,6 +241,51 @@ final class ExceptionMailerTest extends TestCase
         ], $post);
     }
 
+    public function testPasswordInJsonStringParameterIsFullyRedacted(): void
+    {
+        // A GraphQL multipart request (file upload): query and variables travel as a JSON string in "operations".
+        $operations = json_encode([
+            'query' => 'mutation ($payload: UserSubscribePayload!) { UserSubscribe(payload: $payload) { uuid } }',
+            'variables' => ['payload' => ['email' => 'john@example.com', 'password' => 'not-a-real-password', 'avatar' => null]],
+        ]);
+        $map = json_encode(['0' => ['variables.payload.avatar']]);
+
+        $panels = $this->createMailer()->panels(new Request(request: ['operations' => $operations, 'map' => $map]));
+        $post = $this->findPanel($panels, 'POST Parameters')->getData();
+
+        $this->assertStringNotContainsString('not-a-real-password', $post['operations']);
+        $this->assertSame('[redacted]', json_decode($post['operations'], true)['variables']['payload']['password']);
+        $this->assertSame('john@example.com', json_decode($post['operations'], true)['variables']['payload']['email']);
+        $this->assertSame($map, $post['map'], 'A JSON string without sensitive key is kept as is');
+    }
+
+    public function testSessionCookieIsRedactedWhenTheSessionWasNotInitialized(): void
+    {
+        // A session cookie whose name matches no pattern, on a request where the application never touched the session
+        $request = new Request(cookies: ['sid' => 'secret-session-id-value']);
+        $request->setSessionFactory(fn () => new Session(new MockArraySessionStorage('sid')));
+
+        $panels = $this->createMailer(withTokenStorage: false)->panels($request);
+
+        $this->assertSame('secret-s…[redacted]', $this->findPanel($panels, 'Cookies')->getData()['sid']);
+        $this->assertNull($this->findPanel($panels, 'Session'), 'The session is not started just to show it');
+        $this->assertFalse($request->getSession()->isStarted());
+    }
+
+    public function testExceptionWithUnexpectedGetViolationsSignatureIsIgnored(): void
+    {
+        $exception = new class('Invalid payload') extends \Exception {
+            public function getViolations(string $group): array
+            {
+                return [];
+            }
+        };
+
+        $panels = $this->createMailer()->panels(new Request(), $exception);
+
+        $this->assertNull($this->findPanel($panels, 'Validation errors'));
+    }
+
     public function testNonJsonBodyStillGetsAPanel(): void
     {
         $panels = $this->createMailer()->panels(new Request(content: 'not json'));
@@ -255,21 +300,18 @@ final class ExceptionMailerTest extends TestCase
     }
 
     /**
-     * Exposes the protected getRequestDataPanels() method, with the exception
-     * captured the same way sendException() does.
+     * Exposes the panels of the email: the error's own panels (protected getExceptionDataPanels()) followed by the
+     * request ones (protected getRequestDataPanels()).
      */
     private function createMailer(bool $withTokenStorage = true): object
     {
         return new class($this->createStub(MailerInterface::class), $this->createStub(Environment::class), null, 'from@example.com', 'to@example.com', 'subject', [], [], [], $withTokenStorage ? $this->tokenStorage : null) extends ExceptionMailer {
             public function panels(Request $request, ?\Throwable $exception = null): array
             {
-                $this->currentException = $exception;
-
-                try {
-                    return $this->getRequestDataPanels($request);
-                } finally {
-                    $this->currentException = null;
-                }
+                return [
+                    ...$this->getExceptionDataPanels($exception ?? new \Exception(), $request),
+                    ...$this->getRequestDataPanels($request),
+                ];
             }
         };
     }

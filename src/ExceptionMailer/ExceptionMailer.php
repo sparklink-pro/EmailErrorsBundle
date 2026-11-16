@@ -38,7 +38,10 @@ class ExceptionMailer
      */
     protected const SENSITIVE_PARAMETER_PATTERNS = ['password', 'passwd', 'secret'];
 
-    protected ?\Throwable $currentException = null;
+    /**
+     * True while an email is being prepared or sent: see sendExceptionWithPanels().
+     */
+    private bool $sending = false;
 
     public function __construct(
         protected MailerInterface $mailer,
@@ -58,7 +61,26 @@ class ExceptionMailer
 
     public function sendException(\Throwable $exception, ?Request $request = null, ?HttpKernelInterface $kernel = null)
     {
-        $this->currentException = $exception;
+        $this->sendExceptionWithPanels($exception, [], $request, $kernel);
+    }
+
+    /**
+     * Same as sendException(), with additional panels shown in the "Details" block of the email, next to the error's
+     * own panels (e.g. the context of a log record, sent by the Monolog handler). Their array data is redacted like
+     * request parameters.
+     *
+     * @param DataPanel[] $panels
+     */
+    public function sendExceptionWithPanels(\Throwable $exception, array $panels, ?Request $request = null, ?HttpKernelInterface $kernel = null): void
+    {
+        // An error raised while this email is prepared or sent and reported again to this mailer (failure logged to a
+        // channel the Monolog handler listens to, application listener of a mailer event...) is not sent: it would
+        // fail the same way, again and again, each attempt waiting for the mail server.
+        if ($this->sending) {
+            return;
+        }
+
+        $this->sending = true;
 
         try {
             // Ignored exceptions
@@ -94,15 +116,14 @@ class ExceptionMailer
             $mail->subject(sprintf('%s %s', $this->subject, $exception->getMessage()));
 
             $exceptions = [];
-            $exceptions[] = ['class' => $exception::class, 'instance' => $exception];
-
-            while ($exception = $exception->getPrevious()) {
-                $exceptions[] = ['class' => $exception::class, 'instance' => $exception];
+            for ($error = $exception; null !== $error; $error = $error->getPrevious()) {
+                $exceptions[] = ['class' => $error::class, 'instance' => $error];
             }
 
             $mail->html($this->twig->render('@EmailErrors/exception.html.twig', [
                 'subject' => $this->subject,
                 'exceptions' => $exceptions,
+                'exception_panels' => [...$this->getExceptionDataPanels($exception, $request), ...$this->redactPanels($panels)],
                 'request' => $request,
                 'request_panels' => $request ? $this->getRequestDataPanels($request) : [],
                 'kernel' => $kernel,
@@ -113,17 +134,22 @@ class ExceptionMailer
             if ($throttleItem) {
                 $this->cache->save($throttleItem->set(true)->expiresAfter($this->throttle));
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            // \Throwable, not \Exception: an \Error raised here (TypeError...) would otherwise escape to the caller and
+            // replace the original error page, or crash the command that logged the record
             $this->logger?->error('Error sending exception email', ['exception' => $e->getMessage()]);
         } finally {
-            $this->currentException = null;
+            $this->sending = false;
         }
     }
 
     /**
-     * Cache item of an error when throttling is on: the same error (class, message, file and line) is sent at most once
-     * per $throttle seconds, so an error repeated in a loop (a page called again and again, a command run every minute)
-     * doesn't flood the mailbox.
+     * Cache item of an error when throttling is on: the same error is sent at most once per $throttle seconds, so an
+     * error repeated in a loop (a page called again and again, a command run every minute) doesn't flood the mailbox.
+     *
+     * The whole chain of previous exceptions is part of the key (class, message, file and line of each), as well as the
+     * constraint violations: GraphQL errors, for instance, are all GraphQL\Error\Error instances built at the same place,
+     * whatever the exception they wrap, and a generic "Invalid payload" error only differs from another by its violations.
      */
     protected function getThrottleItem(\Throwable $exception): ?CacheItemInterface
     {
@@ -131,7 +157,49 @@ class ExceptionMailer
             return null;
         }
 
-        return $this->cache->getItem('email_errors_'.sha1($exception::class.'|'.$exception->getMessage().'|'.$exception->getFile().'|'.$exception->getLine()));
+        $parts = [];
+        for ($error = $exception; null !== $error; $error = $error->getPrevious()) {
+            $parts[] = $error::class.'|'.$error->getMessage().'|'.$error->getFile().'|'.$error->getLine();
+        }
+        array_push($parts, ...$this->getViolationsData($exception));
+
+        return $this->cache->getItem('email_errors_'.sha1(implode("\n", $parts)));
+    }
+
+    /**
+     * Panels about the error itself rather than the request, shown in the "Details" block of the email: they are there
+     * even without a request (command, Messenger worker, record logged by a command).
+     *
+     * @return DataPanel[]
+     */
+    protected function getExceptionDataPanels(\Throwable $exception, ?Request $request): array
+    {
+        $panels = [];
+
+        if (null !== $request && null !== $probableCause = $this->getProbableCause($exception)) {
+            $panels[] = new DataPanel('Probable cause', $probableCause, DataPanel::TYPE_STRING);
+        }
+
+        if (!empty($violations = $this->getViolationsData($exception))) {
+            $panels[] = new DataPanel('Validation errors', $violations);
+        }
+
+        return $panels;
+    }
+
+    /**
+     * @param DataPanel[] $panels
+     *
+     * @return DataPanel[]
+     */
+    protected function redactPanels(array $panels): array
+    {
+        return array_map(
+            fn (DataPanel $panel) => \is_array($panel->getData())
+                ? new DataPanel($panel->getTitle(), $this->redactParameters($panel->getData()), $panel->getType())
+                : $panel,
+            $panels
+        );
     }
 
     /**
@@ -141,16 +209,13 @@ class ExceptionMailer
     {
         $panels = [];
 
-        if (null !== $probableCause = $this->getProbableCause()) {
-            $panels[] = new DataPanel('Probable cause', $probableCause, DataPanel::TYPE_STRING);
-        }
+        // Read before anything else: the Security panel and the cookie redaction get the session name, which turns a
+        // lazy session factory into a session object (without starting it). The Session panel, which starts the
+        // session, must still only appear when the application had already used it.
+        $sessionWasInitialized = $request->hasSession(true);
 
         if (null !== $this->tokenStorage) {
             $panels[] = new DataPanel('Security', $this->getSecurityData($request));
-        }
-
-        if (!empty($violations = $this->getViolationsData())) {
-            $panels[] = new DataPanel('Validation errors', $violations);
         }
 
         if (!empty($request->query->all())) {
@@ -192,25 +257,29 @@ class ExceptionMailer
             $panels[] = new DataPanel('Cookies', $this->redactCookies($request->cookies->all(), $request));
         }
 
-        if ($request->hasSession(true)) {
+        if ($sessionWasInitialized) {
             $panels[] = new DataPanel('Session', $this->redactSessionData($request->getSession()->all()));
         }
 
         return $panels;
     }
 
-    /**
-     * Extracts constraint violations from the exception chain (duck-typed so the
-     * bundle needs no dependency on symfony/validator): errors like a validation
-     * failure otherwise only show a generic "Invalid payload" message, hiding
-     * which constraint was violated (quota reached, blank field...).
-     */
-    protected function getViolationsData(): array
+    protected function getViolationsData(?\Throwable $exception): array
     {
         $data = [];
 
-        for ($exception = $this->currentException; null !== $exception; $exception = $exception->getPrevious()) {
-            if (!method_exists($exception, 'getViolations') || !is_iterable($violations = $exception->getViolations())) {
+        for (; null !== $exception; $exception = $exception->getPrevious()) {
+            if (!method_exists($exception, 'getViolations')) {
+                continue;
+            }
+
+            try {
+                $violations = $exception->getViolations();
+            } catch (\Throwable) {
+                continue;
+            }
+
+            if (!is_iterable($violations)) {
                 continue;
             }
 
@@ -219,15 +288,19 @@ class ExceptionMailer
                     continue;
                 }
 
-                $path = method_exists($violation, 'getPropertyPath') ? (string) $violation->getPropertyPath() : '';
-                $code = method_exists($violation, 'getCode') ? $violation->getCode() : null;
+                try {
+                    $path = method_exists($violation, 'getPropertyPath') ? (string) $violation->getPropertyPath() : '';
+                    $code = method_exists($violation, 'getCode') ? $violation->getCode() : null;
 
-                $data[] = sprintf(
-                    '%s%s%s',
-                    '' !== $path ? $path.': ' : '',
-                    $violation->getMessage(),
-                    null !== $code ? sprintf(' (code %s)', $code) : ''
-                );
+                    $data[] = sprintf(
+                        '%s%s%s',
+                        '' !== $path ? $path.': ' : '',
+                        $violation->getMessage(),
+                        null !== $code ? sprintf(' (code %s)', $code) : ''
+                    );
+                } catch (\Throwable) {
+                    continue;
+                }
             }
         }
 
@@ -252,13 +325,13 @@ class ExceptionMailer
      * expression: the "Cannot query field" error they produce looks like a schema
      * bug but is usually just an expired session.
      */
-    protected function getProbableCause(): ?string
+    protected function getProbableCause(\Throwable $exception): ?string
     {
-        if (null === $this->currentException || null === $this->tokenStorage) {
+        if (null === $this->tokenStorage) {
             return null;
         }
 
-        $isSchemaFieldError = str_contains($this->currentException->getMessage(), 'Cannot query field');
+        $isSchemaFieldError = str_contains($exception->getMessage(), 'Cannot query field');
         $isAnonymous = null === $this->tokenStorage->getToken();
 
         if ($isSchemaFieldError && $isAnonymous) {
@@ -285,7 +358,10 @@ class ExceptionMailer
     protected function redactCookies(array $cookies, Request $request): array
     {
         $sensitiveNames = static::SENSITIVE_COOKIES;
-        if ($request->hasSession(true)) {
+        // hasSession() without skipIfUninitialized: the session cookie must be redacted even when the application
+        // never touched the session during this request (stateless route, exception thrown early...). getName()
+        // neither starts the session nor marks it as used.
+        if ($request->hasSession()) {
             $sensitiveNames[] = $request->getSession()->getName();
         }
 
@@ -316,6 +392,10 @@ class ExceptionMailer
     /**
      * Unlike redact(), no prefix is kept: the first characters of a password are
      * part of the secret.
+     *
+     * String values holding a JSON object or array are redacted too, then re-encoded: a GraphQL multipart request
+     * (file upload) sends its query and variables as a JSON string in the "operations" field, and some clients send
+     * "variables" as a JSON string.
      */
     protected function redactParameters(array $data): array
     {
@@ -324,10 +404,30 @@ class ExceptionMailer
                 $data[$key] = '[redacted]';
             } elseif (\is_array($value)) {
                 $data[$key] = $this->redactParameters($value);
+            } elseif (\is_string($value) && null !== $decoded = $this->decodeJsonContainer($value)) {
+                $redacted = $this->redactParameters($decoded);
+                if ($redacted !== $decoded) {
+                    $data[$key] = json_encode($redacted, \JSON_UNESCAPED_SLASHES | \JSON_UNESCAPED_UNICODE) ?: '[redacted]';
+                }
             }
         }
 
         return $data;
+    }
+
+    /**
+     * The decoded value of a string holding a JSON object or array, null for any other string.
+     */
+    protected function decodeJsonContainer(string $value): ?array
+    {
+        $trimmed = ltrim($value);
+        if ('' === $trimmed || ('{' !== $trimmed[0] && '[' !== $trimmed[0])) {
+            return null;
+        }
+
+        $decoded = json_decode($value, true);
+
+        return \is_array($decoded) ? $decoded : null;
     }
 
     protected function isSensitiveParameter(string $key): bool

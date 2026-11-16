@@ -18,9 +18,36 @@ final class ThrottleTest extends TestCase
     }
 
     /** Same class, message, file and line each time */
-    private function error(string $message = 'Boom'): \RuntimeException
+    private function error(string $message = 'Boom', ?\Throwable $previous = null): \RuntimeException
     {
-        return new \RuntimeException($message);
+        return new \RuntimeException($message, 0, $previous);
+    }
+
+    /** A generic error carrying a single constraint violation, thrown from the same place each time */
+    private function invalidPayload(string $violationMessage): \Exception
+    {
+        $violation = new class($violationMessage) {
+            public function __construct(private string $message)
+            {
+            }
+
+            public function getMessage(): string
+            {
+                return $this->message;
+            }
+        };
+
+        return new class('Invalid payload', [$violation]) extends \Exception {
+            public function __construct(string $message, private array $violations)
+            {
+                parent::__construct($message);
+            }
+
+            public function getViolations(): array
+            {
+                return $this->violations;
+            }
+        };
     }
 
     public function testSameErrorIsSentOnceWithinTheThrottle(): void
@@ -41,6 +68,29 @@ final class ThrottleTest extends TestCase
         $exceptionMailer = $this->mailer($mailer, 3600);
         $exceptionMailer->sendException($this->error('Boom'));
         $exceptionMailer->sendException($this->error('Other'));
+    }
+
+    public function testErrorsWrappingDifferentExceptionsAreAllSent(): void
+    {
+        // Like GraphQL errors: same wrapper class, message and place, different underlying exception
+        $mailer = $this->createMock(MailerInterface::class);
+        $mailer->expects($this->exactly(2))->method('send');
+
+        $exceptionMailer = $this->mailer($mailer, 3600);
+        $exceptionMailer->sendException($this->error('Boom', new \LogicException('Cause A')));
+        $exceptionMailer->sendException($this->error('Boom', new \LogicException('Cause B')));
+    }
+
+    public function testErrorsWithDifferentViolationsAreAllSent(): void
+    {
+        $mailer = $this->createMock(MailerInterface::class);
+        $mailer->expects($this->exactly(3))->method('send');
+
+        $exceptionMailer = $this->mailer($mailer, 3600);
+        $exceptionMailer->sendException($this->invalidPayload('Inquiry-quota has been reached today.'));
+        $exceptionMailer->sendException($this->invalidPayload('This email is already used.'));
+        $exceptionMailer->sendException($this->invalidPayload('This email is already used.'));
+        $exceptionMailer->sendException($this->error('Boom', $this->invalidPayload('Inquiry-quota has been reached today.')));
     }
 
     public function testEverythingIsSentWithoutThrottle(): void

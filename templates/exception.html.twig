@@ -707,6 +707,45 @@
 											<!-- END MODULE: Logo -->
 										</td>
 									</tr>
+									{% if exception_panels|default([]) is not empty %}
+										<tr>
+											<td valign="top">
+												<!-- BEGIN MODULE: Details (panels about the error itself, shown with or without a request) -->
+												<table width="100%" border="0" cellspacing="0" cellpadding="0" role="presentation">
+													<tr>
+														<td class="pc-w620-spacing-0-0-10-0" style="padding: 0px 0px 10px 0px;">
+															<table width="100%" border="0" cellspacing="0" cellpadding="0" role="presentation">
+																<tr>
+																	<td valign="top" class="pc-w620-padding-6-6-6-6" style="padding: 20px 20px 20px 20px;border-radius: 8px 8px 8px 8px;background-color: #FFFFFF;box-shadow: 0px 2px 4px 0px rgba(0,0,0,0.1);" bgcolor="#FFFFFF">
+																		<table width="100%" border="0" cellpadding="0" cellspacing="0" role="presentation">
+																			<tr>
+																				<td align="left" valign="top" style="padding: 0px 0px 10px 0px;">
+																					<table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%" align="left">
+																						<tr>
+																							<td valign="top" class="pc-font-alt" align="left" style="padding: 0px 0px 0px 0px;mso-line-height: exactly;line-height: 21px;font-family: Fira Sans, Arial, Helvetica, sans-serif;font-size: 26px;font-weight: normal;color: #333333;text-align: left;text-align-last: left;font-variant-ligatures: normal;">
+																								<div>
+																									<span>Details</span>
+																								</div>
+																							</td>
+																						</tr>
+																					</table>
+																				</td>
+																			</tr>
+																		</table>
+																		{{ _self.separator(12) }}
+																		{% for panel in exception_panels %}
+																			{{ _self.panelData(panel) }}
+																		{% endfor %}
+																	</td>
+																</tr>
+															</table>
+														</td>
+													</tr>
+												</table>
+												<!-- END MODULE: Details -->
+											</td>
+										</tr>
+									{% endif %}
 									{% for exception in exceptions %}
 										<tr>
 											<td valign="top">
