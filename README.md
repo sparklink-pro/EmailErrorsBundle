@@ -7,9 +7,6 @@
 
 This Symfony bundle provides a way to send email notifications when an error occurs in your application.
 
-![EmailErrorsBundle](./docs/screeenshot/email_errors.png)
-![EmailErrorsBundle](./docs/screeenshot/email_errors_2.png)
-
 ## Download the Bundle
 
 Open a command console, enter your project directory and execute the following command to download the latest stable version of this bundle:
@@ -55,15 +52,33 @@ Create a new file `config/packages/email_errors.yaml` and add the following conf
 ```yaml
 # config/packages/email_errors.yaml
 email_errors:
-  enabled: "%kernel.debug%"           
   from: "%env(resolve:MAILER_ERRORS_FROM)%"
   to: "%env(resolve:MAILER_ERRORS_TO)%"
-  ignored_exception_class: [] 
+  ignored_exception_classes: []
   graphql: true
+
+when@dev:
+  email_errors:
+    enabled: false
+
+when@test:
+  email_errors:
+    enabled: false
 ```
 
-You can ignore some exceptions by adding the class name in the `ignored_exception_class` array.  
-If `graphql` is set to `true`, the bundle will also handle errors from the `GraphQLBundle` and send them.
+| Option | Default | Description |
+|---|---|---|
+| `enabled` | `true` | When `false`, nothing is sent. It is read when the container is built: disable the bundle per environment with `when@<env>` as above, not with an environment variable (an `%env()%` value always counts as enabled). |
+| `from` | *required* | Sender address of the emails. |
+| `to` | *required* | Recipient address of the emails. |
+| `subject` | `Exception` | Start of the email subject, followed by the error message. |
+| `mailer_service` | `mailer.mailer` | Id of the service sending the emails, a `Symfony\Component\Mailer\MailerInterface`. |
+| `ignored_exception_classes` | `[]` | Errors not sent, by exact class: a subclass, or an error whose previous exception has this class, is still sent. A GraphQL error usually has the class `GraphQL\Error\Error`, whatever exception it wraps: ignore it by message instead. |
+| `ignored_exception_messages` | `[]` | Errors not sent when their message contains one of these strings (case-sensitive). |
+| `ignored_ip_addresses` | `[]` | Errors of requests coming from one of these IP addresses are not sent. Exact addresses only (no ranges), compared to the client IPs given by `Request::getClientIps()`: behind a reverse proxy, configure Symfony's trusted proxies, otherwise only the proxy's address is seen. Errors without a request (commands, workers) are not concerned. |
+| `graphql` | `false` | Also sends the errors returned in the GraphQL responses of OverblogGraphQLBundle, which are not thrown and so never reach the exception listener. |
+| `throttle` | `0` | See [Throttling](#throttling). |
+| `monolog_level` | `critical` | See [Sending log records (Monolog)](#sending-log-records-monolog). |
 
 ## Security panel
 
@@ -109,7 +124,7 @@ With an asynchronous mailer (Symfony Messenger), the mailer only puts the email 
 
 ## Sending log records (Monolog)
 
-When Monolog is installed, the bundle defines a Monolog handler, `email_errors.monolog_handler`, which sends the records it receives through the same mailer as the exceptions: same template, filters, redaction and throttling. The exception of the record (`['exception' => $e]` in its context) is sent if there is one, otherwise its message, with the stack trace of where it was logged. A **Log record** panel shows the message, channel and level of the record, its context (the exception aside) and its extra data, redacted like request parameters. The context is not part of the throttling: two records with the same message and different context values are the same error.
+When Monolog 3 is installed, the bundle defines a Monolog handler, `email_errors.monolog_handler`, which sends the records it receives through the same mailer as the exceptions: same template, filters, redaction and throttling. The exception of the record (`['exception' => $e]` in its context) is sent if there is one, otherwise its message, with the stack trace of where it was logged. A **Log record** panel shows the message, channel and level of the record, its context (the exception aside) and its extra data, redacted like request parameters. The context is not part of the throttling: two records with the same message and different context values are the same error.
 
 It only sends the records from its level, `critical` by default (option `monolog_level`: a Monolog level name — `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`, in any case — or value; an invalid level is reported when the container is built, unless it comes from an environment variable). Use it for one channel, for example the alerts of a synchronisation run by a command, which the exception listener doesn't see:
 
@@ -126,6 +141,27 @@ monolog:
 
 Then `$crmLogger->critical('No sync succeeded for 15 minutes')` sends an email. Avoid using it for every channel: Symfony already logs each uncaught exception of a page as critical in the `request` channel, which the exception listener sends too.
 
-When the bundle is disabled (`enabled: false`), the handler still exists but sends nothing, so the Monolog configuration keeps working.
+### Errors of commands and Messenger workers
+
+The exception listener only sees the errors of pages (`kernel.exception`). Symfony already logs the other uncaught errors as critical, with the exception in the context:
+
+- an exception thrown by a console command, in the `console` channel;
+- a Messenger message given up after its retries, in the `messenger` channel (each retry is only logged as a warning).
+
+Listening to these channels is enough to receive them by email, with the exception and its stack trace, and the command line in the **Log record** panel:
+
+```yaml
+# config/packages/monolog.yaml
+monolog:
+    handlers:
+        email_errors:
+            type: service
+            id: email_errors.monolog_handler
+            channels: [console, messenger]
+```
+
+An exception caught by the command itself (a `try`/`catch` returning `Command::FAILURE`) is not logged by Symfony: log it as critical to receive it. A command that ends with a non-zero exit code without an exception sends nothing.
+
+When the bundle is disabled (`enabled: false`), the handler still exists but sends nothing, so the Monolog configuration keeps working. With Monolog 2, on the contrary, the handler is not defined at all: a Monolog configuration using it fails when the container is built.
 
 An error raised while an email is being sent, and reported again to the mailer (for example the "Error sending exception email" record, if the handler listens to the main channel with the `error` level), is not sent: it would fail the same way, again and again.
